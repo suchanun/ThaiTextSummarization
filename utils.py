@@ -1,28 +1,30 @@
-import os
 import numpy as np
-
 from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 import re
-import pickle
 from pythainlp.corpus import thai_stopwords
 import pythainlp as pythai
-import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-# stop_list = thai_stopwords()
+import plotly
+
+
+def custom_preprocess(text):
+    return re.sub(re.compile('({}|{})'.format("\b[+-]?\d+(?:\.\d+)?\b", "[^\u0E00-\u0E7Fa-zA-Z' ]|^'|'$|''")), '',
+                  pythai.util.normalize(text.lower()))
+
+
 class ThaiRanker:
     def __init__(self, df, n_docs=1000, stoplist=thai_stopwords(),
                  smooth_idf=True, sentence_tokenize=pythai.tokenize.sent_tokenize,
-                 word_tokenize=pythai.tokenize.word_tokenize):
+                 word_tokenize=pythai.tokenize.word_tokenize, preprocessor=custom_preprocess):
         texts = df['body_text']
-
         self.sentence_tokenize = sentence_tokenize
         self.word_tokenize = word_tokenize
         self.n_docs = n_docs
         self.stoplist = stoplist
         self.smooth_idf = smooth_idf
+        self.preprocessor = preprocessor
 
         count_vect = self.get_new_countvect()
         self.docs_word_freq = count_vect.fit_transform(texts).toarray()  # (docs, words)
@@ -36,15 +38,22 @@ class ThaiRanker:
 
     def get_new_countvect(self):
         return CountVectorizer(tokenizer=self.word_tokenize,
-                               preprocessor=lambda x: re.sub(r'(\d[\d\.])+', '', x.lower()), stop_words=self.stoplist)
+                               preprocessor=self.preprocessor, stop_words=self.stoplist)
 
     def process_text(self, text):
         ori_text_nodouble_newline = re.sub(r'\n+', '\n', text).strip()
         sentences = []
+        start_indices_of_paragraphs = set()
+        si = 0
         for paragraph in ori_text_nodouble_newline.split('\n'):
-            sentences.extend(
-                self.sentence_tokenize(paragraph))  # self.sentence_tokenize(ori_text) self.sentence_tokenize(text)
-        n_sentences = len(sentences)
+            start_indices_of_paragraphs.add(si)
+            psentences = self.sentence_tokenize(paragraph)
+            sentences.extend(psentences)
+            n_psentences = len(psentences)
+            si += n_psentences  # sentences in paragraph
+            # self.sentence_tokenize(ori_text) self.sentence_tokenize(text)
+        n_sentences = len(sentences)  # all sentences in text
+        print('n_sentences == {}'.format(len(sentences)))
 
         text = text.lower()
         #         lemmatized_text = self.lemmatize(text)
@@ -58,6 +67,7 @@ class ThaiRanker:
         text_info['tfidf'] = self.get_tfidf_vect(text_info['word_freq'], text_info['vocab'])
         text_info['sentences'] = sentences
         text_info['n_sentences'] = n_sentences
+        text_info['start_indices_of_paragraphs'] = start_indices_of_paragraphs
         return text_info
 
     def get_tfidf_vect(self, word_freq, vocab):
@@ -66,8 +76,8 @@ class ThaiRanker:
         for word in vocab:
             idx = vocab[word]
             tf = word_freq[idx]
-            #             if re.search( r"[^\u0E00-\u0E7Fa-zA-Z' ]|^'|'$|''", word) is None:
-            #                 tf = 0
+            #                         if re.search( r"[^\u0E00-\u0E7Fa-zA-Z' ]|^'|'$|''", word) is None:
+            #                             tf = 0
             if word not in self.docs_vocab:
                 idf = d
             else:
@@ -78,13 +88,12 @@ class ThaiRanker:
 
     def get_score(self, sentence, text_info, words_already_in_summ, k, m, min_sentence_len):
 
-        sentence = sentence.lower()
+        # remove numerical substrings and other non-alphabet substrings
+        sentence = self.preprocessor(sentence)  # sentence.lower()
 
         tfidf_vect, vocab = text_info['tfidf'], text_info['vocab']
         words = [word for word in self.word_tokenize(sentence) if
-                 (word not in self.stoplist)]  # and (re.search('[a-zA-Z]', word) is not None
-        #         words = [self.lemmatize(word, word=True) for word in words]
-
+                 (word not in self.stoplist)]
         n_words = 0
         score = 0
         for word in words:
@@ -104,6 +113,13 @@ class ThaiRanker:
         words_already_in_summ.update(words)
         return score / n_words
 
+    # min_sentence_len > 0
+    def rank_phrases(self, text, n, k=1, min_sentence_len=4, m=0.3):
+        sentences_with_scores, start_indices_of_paragraphs = self.rank_sentences(text, k, min_sentence_len, m)
+        groups, start_indices_of_paragraphs = self.group_sentences(sentences_with_scores, start_indices_of_paragraphs)
+        paragraphs = self.sentence_groups_to_paragraph(groups, start_indices_of_paragraphs, n)
+        return sentences_with_scores,paragraphs
+
     def rank_sentences(self, text, k=0.5, min_sentence_len=4, m=0.3):
         text_info = self.process_text(text)
         sentences = [(i, sentence) for i, sentence in enumerate(text_info['sentences'])]
@@ -119,35 +135,164 @@ class ThaiRanker:
             sentences.remove((i, selected_sentence))
             words_in_summ.update(self.word_tokenize(selected_sentence))
             n_selected += 1
-        return selected_sentences
-    def group_sentences(self, selected_sentences, n):
+        return selected_sentences, text_info['start_indices_of_paragraphs']
+
+    #     def rank_and_group_sentences(self, text, k=1, min_sentence_len=4, m=0.3):
+    #         selected_sentences,start_indices_of_paragraphs = self.rank_sentences(text, k, min_sentence_len, m)
+    #         return self.group_sentences(selected_sentences,start_indices_of_paragraphs)
+    def find_paragraph_index(self, start_indices_of_paragraphs, sentence_index):
+        last_p_index = 0
+        for current_p_index in start_indices_of_paragraphs:
+            if sentence_index == current_p_index:
+                return current_p_index
+            elif sentence_index < current_p_index:
+                return last_p_index
+            last_p_index = current_p_index
+        return last_p_index
+
+    def group_sentences(self, sentences_with_scores, start_indices_of_paragraphs):
         ans = []
-        if not selected_sentences:
+        if not sentences_with_scores:
             return ans
-        sentences_by_order_in_text = sorted(selected_sentences,key=lambda tup:tup[0])
-        si = selected_sentences[0][0]
-        # for ai in range(n):
+        sentences_by_order_in_text = sorted(sentences_with_scores, key=lambda tup: tup[0])
+        sorted_paragraphs_indices = sorted(list(start_indices_of_paragraphs))
+        irank = 0
+        sentence_order = sentences_with_scores[irank][0]
+        max_n = len(sentences_by_order_in_text)
+        selected_count = 0
+        selected = set()
+        groups = []
+        while selected_count < max_n:
+            group = []
+            while sentence_order in selected:
+                irank += 1
+                sentence_order = sentences_with_scores[irank][0]
 
+            # print(sentences_with_scores)
 
+            score = sentences_by_order_in_text[sentence_order][2]
+            group_paragraph = self.find_paragraph_index(sorted_paragraphs_indices, sentence_order)
 
+            # left side
+            left_order = sentence_order - 1
+            while left_order >= 0 and sentences_by_order_in_text[left_order][2] <= score \
+                    and left_order not in selected and self.find_paragraph_index(sorted_paragraphs_indices,
+                                                                                 left_order) == group_paragraph:
+                score = sentences_by_order_in_text[left_order][2]
+                left_order -= 1
+            for order in range(left_order + 1, sentence_order + 1):
+                group.append(sentences_by_order_in_text[order])
+                selected.add(order)
+                selected_count += 1
+            # right side
+            score = sentences_by_order_in_text[sentence_order][2]
+            right_order = sentence_order + 1
+            while right_order < max_n and sentences_by_order_in_text[right_order][2] <= score \
+                    and right_order not in selected and self.find_paragraph_index(sorted_paragraphs_indices,
+                                                                                  right_order) == group_paragraph:
+                score = sentences_by_order_in_text[right_order][2]
+                right_order += 1
+            for order in range(sentence_order + 1, right_order):
+                group.append(sentences_by_order_in_text[order])
+                selected.add(order)
+                selected_count += 1
+            groups.append(group)
+        return groups, start_indices_of_paragraphs
+        # while right_ci<
+
+    def sentence_groups_to_paragraph(self, sentence_groups, start_indices_of_paragraphs, n_groups):
+        paragraphs = dict()
+        for p_index in start_indices_of_paragraphs:
+            paragraphs[p_index] = []
+        start_indices_of_paragraphs = sorted(list(start_indices_of_paragraphs))
+
+        for group in sentence_groups[:n_groups]:
+            sentence = group[0]
+            p_index = self.find_paragraph_index(start_indices_of_paragraphs, sentence[0])  # ][0])
+            paragraphs[p_index].append(group)
+        for p_index in start_indices_of_paragraphs:
+            paragraphs[p_index] = sorted(paragraphs[p_index], key=lambda tup: tup[0])
+        return paragraphs
 
 
 class Displayer:
     @staticmethod
-    def show_custom(info, n_sentences):
-        text = info['text']#.replace('``', '""')
-        top_n_my_model = info['my_model_result'][:n_sentences]
-
+    def show_summary_and_text(info):
+        st.header(info['title'])
+        text = info['text']
+        paragraphs = info['paragraphs']
+        sentences_with_scores = sorted(info['sentences_with_scores'],key=lambda tup: tup[0])
+        paragraph_numbers = sorted(list(paragraphs.keys()))
         st.subheader('My Summary')
-        sorted_summ = sorted(top_n_my_model, key=lambda sentence: sentence[0])
+        last_phrase_index = -1
+        prev_phrases = ''
+        selected_sentences = []
+        selected_indices = []
+        print(paragraphs)
+        for p_num in paragraph_numbers:
+            paragraph = paragraphs[p_num]
+            # st.text('p_num == {}'.format(p_num))
+            for phrases_group in paragraph:
+                sentences_tokens = [tup[1] for tup in phrases_group]
+                selected_indices.extend([tup[0] for tup in phrases_group])
+                sentences = ' '.join(sentences_tokens)
+                selected_sentences.extend(sentences_tokens)
+                phrase_index = phrases_group[0][0]
+                # st.text('phrase_index == {}, sentences == '.format(phrase_index, sentences))
+                #print(repr(sentences))
+                # print('last_phrase_index == {}'.format(last_phrase_index))
+                if phrase_index == last_phrase_index + 1:
+                    prev_phrases += ' '+ sentences
+                else:
+                    if prev_phrases != '':# start new phrases
+                        st.markdown(prev_phrases)
+                    prev_phrases = sentences
+                last_phrase_index = phrases_group[-1][0]
 
-        for sentence in sorted_summ:
-            st.markdown('{}\n'.format(sentence[1]))
+        if prev_phrases != '':
+            st.markdown(prev_phrases)
         sentences_group = dict()
-        sentences_group[0] = [sentence[1] for sentence in top_n_my_model]
-        highlighted_text = Highlighter.get_highlighted_html(text, sentences_group)
+        sentences_group[0] = selected_sentences
+        highlighted_text = Highlighter.get_highlighted_html(text, sentences_group).replace('\n','\n\n')
+
+        y = [tup[2] for tup in sentences_with_scores]
+        Displayer.display_selected_in_graph(x=list(range(len(sentences_with_scores))),y=y,selected_indices=selected_indices)
         st.subheader('Highlights Displayed')
         st.markdown(highlighted_text, unsafe_allow_html=True)
+        print(repr(highlighted_text))
+        # for tup in sentences_with_scores:
+        #     st.markdown(tup)
+        # st.markdown(text)
+
+
+    @staticmethod
+    def display_selected_in_graph(x,y,selected_indices,mode='lines+markers'):#color_selected='tomato',
+        # n = len(selected_indices)
+        # y_not_selected = [y[i] for i in range(n) if i not in selected_indices]
+        # y_selected = [y[i] for i in selected_indices]
+        marker_color = np.zeros(len(x))#['tomato']
+        # for idx in selected_indices:
+        #     marker_color[idx]='ocean'
+        np.put(marker_color,selected_indices,1)
+        fig = go.Figure(data=go.Scatter(x=x, y=y, mode=mode,marker=dict(color=marker_color,\
+                                                            colorscale=plotly.colors.sequential.Bluered)))#,colorscale='Hot'
+        st.plotly_chart(fig)
+                #st.markdown(sentence)
+    # @staticmethod
+    # def show_custom(info, n_sentences):
+    #     text = info['text']#.replace('``', '""')
+    #     top_n_my_model = info['my_model_result'][:n_sentences]
+    #
+    #     st.subheader('My Summary')
+    #     sorted_summ = sorted(top_n_my_model, key=lambda sentence: sentence[0])
+    #
+    #     for sentence in sorted_summ:
+    #         st.markdown('{}\n'.format(sentence[1]))
+    #     sentences_group = dict()
+    #     sentences_group[0] = [sentence[1] for sentence in top_n_my_model]
+    #     highlighted_text = Highlighter.get_highlighted_html(text, sentences_group)
+    #     st.subheader('Highlights Displayed')
+    #     st.markdown(highlighted_text, unsafe_allow_html=True)
 
     @staticmethod
     def display_figure(x,y,title,xaxis_title,yaxis_title,mode='lines+markers'):

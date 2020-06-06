@@ -5,7 +5,8 @@ import pythainlp as thainlp
 import numpy as np
 from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
-from utils import custom_preprocess
+
+from visualizer import *
 
 @st.cache(allow_output_mutation=True)
 def load_data():
